@@ -62,11 +62,11 @@ export async function handleOpenPositions(
         if (!oppositeSkewShort) {
           closingSize =
             Number(
-              marketSize.greaterThan(marketSkew) ? marketSize : marketSkew
+              marketSize.greaterThan(marketSkew) ? marketSkew : marketSize
             ) * -1;
         } else {
           closingSize =
-            Number(marketSize.lessThan(marketSkew) ? marketSize : marketSkew) *
+            Number(marketSize.lessThan(marketSkew) ? marketSkew : marketSize) *
             -1;
         }
       }
