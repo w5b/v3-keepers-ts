@@ -9,14 +9,12 @@ import {
 import { calculateExpectedPnL } from "./pnl";
 import { getSkewData } from "./skew";
 import { type PriceData } from "@pythnetwork/client";
-import {
-  Connection,
-  PublicKey,
-  sendAndConfirmTransaction,
-} from "@solana/web3.js";
+import { Connection, PublicKey, sendAndConfirmTransaction } from "@solana/web3.js";
 import { calculateAcceptablePrice } from "./transaction";
 import type { Keypair } from "@solana/web3.js";
 import { TransactionManager } from "./blockhash";
+import { ComputeBudgetProgram } from "@solana/web3.js";
+import { sign } from "crypto";
 
 const HOURS_PER_DAY = 24;
 const MS_TO_HOURS = 1000 * 60 * 60;
@@ -41,9 +39,7 @@ export async function getMarketData(
 ): Promise<MarketToTrade | undefined> {
   const [skewData, pythPriceFeed] = await Promise.all([
     Promise.resolve(getSkewData(marketWrapper.market)),
-    prclSDK.accountFetcher.getPythPriceFeed(
-      marketWrapper.priceFeed()
-    ) as Promise<PriceData>,
+    prclSDK.accountFetcher.getPythPriceFeed(marketWrapper.priceFeed()) as Promise<PriceData>,
   ]);
 
   if (!pythPriceFeed?.price) {
@@ -55,8 +51,7 @@ export async function getMarketData(
     .val.dividedBy(FUNDING_RATE_DENOMINATOR);
 
   const shouldGoLong = !skewData.skewLonged && lastFundingRateValue.lessThan(0);
-  const shouldGoShort =
-    skewData.skewLonged && lastFundingRateValue.greaterThan(0);
+  const shouldGoShort = skewData.skewLonged && lastFundingRateValue.greaterThan(0);
 
   if (!shouldGoLong && !shouldGoShort) {
     return undefined;
@@ -64,9 +59,7 @@ export async function getMarketData(
 
   const isGoingLong = shouldGoLong;
 
-  const sharesToTrade = Math.abs(
-    Number(marketWrapper.market.accounting.skew) / 1000000
-  );
+  const sharesToTrade = Math.abs(Number(marketWrapper.market.accounting.skew) / 1000000);
 
   const fee = marketWrapper.market.settings.makerFeeRate / 1e2;
 
@@ -74,16 +67,11 @@ export async function getMarketData(
     return undefined;
   }
 
-  const hourlyFundingRate = Number(
-    lastFundingRateValue.dividedBy(HOURS_PER_DAY)
-  );
+  const hourlyFundingRate = Number(lastFundingRateValue.dividedBy(HOURS_PER_DAY));
   const fundingVelocityDailyPercentage = Number(
-    marketWrapper
-      .getCurrentFundingVelocity()
-      .val.dividedBy(FUNDING_VELOCITY_DENOMINATOR)
+    marketWrapper.getCurrentFundingVelocity().val.dividedBy(FUNDING_VELOCITY_DENOMINATOR)
   );
-  const timeUntilIndexHours =
-    (indexUpdateData.minTime - currentTime) / MS_TO_HOURS + HOURS_PER_DAY;
+  const timeUntilIndexHours = (indexUpdateData.minTime - currentTime) / MS_TO_HOURS + HOURS_PER_DAY;
 
   const expectedPnL = calculateExpectedPnL(
     marketWrapper,
@@ -129,19 +117,12 @@ export async function findProfitableMarkets(
   tradeOnAllProfitableMarkets: boolean
 ): Promise<MarketToTrade[]> {
   const marketPromises = marketWrappers.map((marketWrapper) =>
-    getMarketData(
-      prclSDK,
-      marketWrapper,
-      amountToTradeUSD,
-      indexUpdateData,
-      currentTime
-    )
+    getMarketData(prclSDK, marketWrapper, amountToTradeUSD, indexUpdateData, currentTime)
   );
 
   const marketResults = await Promise.all(marketPromises);
   let profitableMarkets = marketResults.filter(
-    (result): result is MarketToTrade =>
-      result !== undefined && result.expectedPnL > 100
+    (result): result is MarketToTrade => result !== undefined && result.expectedPnL > 100
   );
 
   if (!tradeOnAllProfitableMarkets) {
@@ -151,7 +132,6 @@ export async function findProfitableMarkets(
 
   return profitableMarkets;
 }
-
 export async function processMarketBatch(
   prclSDK: ParclV3Sdk,
   batch: MarketToTrade[],
@@ -159,12 +139,24 @@ export async function processMarketBatch(
   connection: Connection,
   signer: Keypair,
   exchangeAddress: PublicKey,
-  marginAccountAddress: PublicKey
-): Promise<void> {
+  marginAccountAddress: PublicKey,
+  previousBatchesMarketAddress: PublicKey[],
+  previousBatchesMarketPriceFeeds: PublicKey[]
+): Promise<PublicKey[][]> {
   let transaction = prclSDK.transactionBuilder();
 
+  const marketsAddresses = batch.map((market) => {
+    const [marketAddress] = getMarketPda(exchangeAddress, market.marketWrapper.market.id);
+    return marketAddress;
+  });
+
+  const marketsPriceFeeds = batch.map((market) => market.marketWrapper.priceFeed());
+
+  const allMarketAddresses = [...previousBatchesMarketAddress, ...marketsAddresses];
+  const allPriceFeeds = [...previousBatchesMarketPriceFeeds, ...marketsPriceFeeds];
+
   for (const marketToTrade of batch) {
-    transaction = transaction.modifyPosition(
+    transaction.modifyPosition(
       {
         exchange: exchangeAddress,
         marginAccount: marginAccountAddress,
@@ -172,10 +164,7 @@ export async function processMarketBatch(
       },
       {
         sizeDelta: parseSize(
-          ((ratio *
-            Number(marketToTrade.marketWrapper.market.accounting.skew)) /
-            1e6) *
-            -1
+          ((ratio * Number(marketToTrade.marketWrapper.market.accounting.skew)) / 1e6) * -1
         ),
         marketId: marketToTrade.marketWrapper.market.id,
         acceptablePrice: calculateAcceptablePrice(
@@ -183,27 +172,41 @@ export async function processMarketBatch(
           marketToTrade.pythPriceFeed.price!
         ),
       },
-      batch.map((market) => {
-        const [marketAddress] = getMarketPda(
-          exchangeAddress,
-          market.marketWrapper.market.id
-        );
-        return marketAddress;
-      }),
-      batch.map((market) => market.marketWrapper.priceFeed())
+      allMarketAddresses,
+      allPriceFeeds
     );
   }
+
+  transaction.instruction(
+    ComputeBudgetProgram.setComputeUnitLimit({
+      units: allMarketAddresses.length * 200_000,
+    })
+  );
 
   const tm = new TransactionManager(connection);
   const blockhash = await tm.getLatestBlockhash();
 
-  const tx = transaction
-    .feePayer(signer.publicKey)
-    .buildSigned([signer], blockhash);
+  const tx = transaction.feePayer(signer.publicKey).buildSigned([signer], blockhash);
 
   try {
     const result = await sendAndConfirmTransaction(connection, tx, [signer]);
   } catch (e) {
-    console.error(e);
-  } //might cause error 6000 that is integer overflow and is completly random. need to be fixed by prcl!!!!!!
+    if (JSON.stringify(e).includes("Error Number: 6000")) {
+      //prcl integer overflow bug - completely random
+
+      await processMarketBatch(
+        prclSDK,
+        batch,
+        ratio,
+        connection,
+        signer,
+        exchangeAddress,
+        marginAccountAddress,
+        previousBatchesMarketAddress,
+        previousBatchesMarketPriceFeeds
+      );
+    }
+  }
+
+  return [marketsAddresses, marketsPriceFeeds];
 }

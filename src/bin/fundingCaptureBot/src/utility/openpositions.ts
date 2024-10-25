@@ -1,19 +1,11 @@
-import type {
-  MarketWrapper,
-  ParclV3Sdk,
-  PositionWrapper,
-} from "../../v3-sdk-ts/src";
-import {
-  Keypair,
-  PublicKey,
-  Connection,
-  sendAndConfirmTransaction,
-} from "@solana/web3.js";
+import type { MarketWrapper, ParclV3Sdk, PositionWrapper } from "../../v3-sdk-ts/src";
+import { Keypair, PublicKey, Connection, sendAndConfirmTransaction } from "@solana/web3.js";
 import { calculateAcceptablePrice } from "./transaction";
 import { type PriceData } from "@pythnetwork/client";
 
 import { getMarketPda, parsePrice, parseSize } from "../../v3-sdk-ts/src";
 import { TransactionManager } from "./blockhash";
+import { ComputeBudgetProgram } from "@solana/web3.js";
 
 export async function handleOpenPositions(
   prclSDK: ParclV3Sdk,
@@ -25,116 +17,138 @@ export async function handleOpenPositions(
   connection: Connection,
   closeAtIndex?: boolean
 ) {
-  let transaction = prclSDK.transactionBuilder();
-  let currentBatchCount = 0;
+  const marketMap = new Map(marketWrappers.map((market) => [market.market.id, market]));
 
-  const tm = new TransactionManager(connection);
-  const blockhash = await tm.getLatestBlockhash();
+  // First, collect all market addresses and price feeds
+  const allMarketData: {
+    marketAddress: PublicKey;
+    priceFeed: PublicKey;
+  }[] = [];
 
-  const marketMap = new Map(
-    marketWrappers.map((market) => [market.market.id, market])
-  );
-
-  const openPositionMarkets: MarketWrapper[] = [];
-
-  for (const position of openPositions) {
-    const market = marketMap.get(position.marketId());
-    if (market) {
-      openPositionMarkets.push(market);
-    }
-  }
-
+  // Collect all market addresses and price feeds up front
   for (const position of openPositions) {
     const marketToTrade = marketMap.get(position.marketId());
     if (!marketToTrade) continue;
 
-    const marketSkew = Number(marketToTrade.market.accounting.skew);
-    const marketSize = position.size().val.dividedBy(1e9);
+    const [marketAddress] = getMarketPda(exchangeAddress, position.marketId());
+    allMarketData.push({
+      marketAddress,
+      priceFeed: marketToTrade.priceFeed(),
+    });
+  }
 
-    const oppositeSkewShort = marketSize.greaterThan(0) && marketSkew > 0;
-    const oppositeSkewLong = marketSize.lessThan(0) && marketSkew < 0;
+  let remainingMarketAddresses = allMarketData.map((data) => data.marketAddress);
+  let remainingPriceFeeds = allMarketData.map((data) => data.priceFeed);
 
-    if (oppositeSkewShort || oppositeSkewLong || closeAtIndex) {
-      let closingSize;
-      if (closeAtIndex) {
-        closingSize = -Number(marketSize);
-      } else {
-        if (!oppositeSkewShort) {
-          closingSize =
-            Number(
-              marketSize.greaterThan(marketSkew) ? marketSize : marketSkew
-            ) * -1;
+  // Process positions in batches of 3
+  for (let i = 0; i < openPositions.length; i += 3) {
+    const currentBatch = openPositions.slice(i, i + 3);
+    const currentBatchData: {
+      closingSize: number;
+      market: PositionWrapper;
+      acceptablePrice: bigint;
+      marketAddress: PublicKey;
+      priceFeed: PublicKey;
+    }[] = [];
+
+    // Prepare batch data
+    for (const position of currentBatch) {
+      const marketToTrade = marketMap.get(position.marketId());
+      if (!marketToTrade) continue;
+
+      const marketSkew = Number(marketToTrade.market.accounting.skew);
+      const marketSize = position.size().val.dividedBy(1e9);
+
+      const oppositeSkewShort = marketSize.greaterThan(0) && marketSkew > 0;
+      const oppositeSkewLong = marketSize.lessThan(0) && marketSkew < 0;
+
+      if (oppositeSkewShort || oppositeSkewLong || closeAtIndex) {
+        let closingSize;
+        if (closeAtIndex) {
+          closingSize = -Number(marketSize);
         } else {
-          closingSize =
-            Number(marketSize.lessThan(marketSkew) ? marketSize : marketSkew) *
-            -1;
+          if (!oppositeSkewShort) {
+            closingSize = Number(marketSize.greaterThan(marketSkew) ? marketSize : marketSkew) * -1;
+          } else {
+            closingSize = Number(marketSize.lessThan(marketSkew) ? marketSize : marketSkew) * -1;
+          }
         }
+
+        const pythPriceFeed = (await prclSDK.accountFetcher.getPythPriceFeed(
+          marketToTrade.priceFeed()
+        )) as PriceData;
+
+        if (!pythPriceFeed?.price) continue;
+
+        const acceptablePrice = closeAtIndex
+          ? (parsePrice((closingSize > 0 ? 1.1 : 0.9) * pythPriceFeed.price) as bigint)
+          : (calculateAcceptablePrice(oppositeSkewLong, pythPriceFeed.price) as bigint);
+
+        const [marketAddress] = getMarketPda(exchangeAddress, position.marketId());
+
+        currentBatchData.push({
+          closingSize,
+          market: position,
+          acceptablePrice,
+          marketAddress,
+          priceFeed: marketToTrade.priceFeed(),
+        });
       }
+    }
 
-      const pythPriceFeed = (await prclSDK.accountFetcher.getPythPriceFeed(
-        marketToTrade.priceFeed()
-      )) as PriceData;
+    if (currentBatchData.length > 0) {
+      const tm = new TransactionManager(connection);
+      const blockhash = await tm.getLatestBlockhash();
 
-      if (!pythPriceFeed?.price) continue;
-
-      const acceptablePrice = closeAtIndex
-        ? parsePrice((closingSize > 0 ? 1.1 : 0.9) * pythPriceFeed.price)
-        : calculateAcceptablePrice(oppositeSkewLong, pythPriceFeed.price);
-
-      transaction = transaction.modifyPosition(
-        {
-          exchange: exchangeAddress,
-          marginAccount: marginAccountAddress,
-          signer: signer.publicKey,
-        },
-        {
-          sizeDelta: closingSize,
-          marketId: position.marketId(),
-          acceptablePrice: acceptablePrice,
-        },
-        openPositionMarkets.map((marketWrapper) => {
-          const [marketAddress] = getMarketPda(
-            exchangeAddress,
-            marketWrapper.market.id
-          );
-
-          return marketAddress;
-        }),
-        openPositionMarkets.map((marketWrapper) => {
-          return marketWrapper.priceFeed();
+      let transaction = prclSDK.transactionBuilder().instruction(
+        ComputeBudgetProgram.setComputeUnitLimit({
+          units: remainingMarketAddresses.length * 200_000,
         })
       );
 
-      currentBatchCount++;
+      for (const data of currentBatchData) {
+        console.log("closing market: " + data.market.marketId());
+        transaction.modifyPosition(
+          {
+            exchange: exchangeAddress,
+            marginAccount: marginAccountAddress,
+            signer: signer.publicKey,
+          },
+          {
+            sizeDelta: data.closingSize,
+            marketId: data.market.marketId(),
+            acceptablePrice: data.acceptablePrice,
+          },
+          remainingMarketAddresses,
+          remainingPriceFeeds
+        );
+      }
 
-      if (currentBatchCount === 3) {
-        const tx = transaction
-          .feePayer(signer.publicKey)
-          .buildSigned([signer], blockhash);
+      const tx = transaction.feePayer(signer.publicKey).buildSigned([signer], blockhash);
 
-        try {
-          const result = await sendAndConfirmTransaction(connection, tx, [
-            signer,
-          ]);
-        } catch (e) {
-          console.error(e);
-        } //might cause error 6000 that is integer overflow and is completly random. need to be fixed by prcl!!!!!!
+      try {
+        const result = await sendAndConfirmTransaction(connection, tx, [signer]);
 
-        transaction = prclSDK.transactionBuilder();
-        currentBatchCount = 0;
+        const processedMarketAddresses = new Set(
+          currentBatchData.map((data) => data.marketAddress.toString())
+        );
+        const processedPriceFeeds = new Set(
+          currentBatchData.map((data) => data.priceFeed.toString())
+        );
+
+        remainingMarketAddresses = remainingMarketAddresses.filter(
+          (addr) => !processedMarketAddresses.has(addr.toString())
+        );
+        remainingPriceFeeds = remainingPriceFeeds.filter(
+          (feed) => !processedPriceFeeds.has(feed.toString())
+        );
+      } catch (e) {
+        if (JSON.stringify(e).includes("Error Number: 6000")) {
+          i -= 3;
+          continue;
+        }
+        console.error(e);
       }
     }
-  }
-
-  if (currentBatchCount > 0) {
-    const tx = transaction
-      .feePayer(signer.publicKey)
-      .buildSigned([signer], blockhash);
-
-    try {
-      const result = await sendAndConfirmTransaction(connection, tx, [signer]);
-    } catch (e) {
-      console.error(e);
-    } //might cause error 6000 that is integer overflow and is completly random. need to be fixed by prcl!!!!!!
   }
 }

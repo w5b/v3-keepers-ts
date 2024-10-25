@@ -30,7 +30,6 @@ type RunPrclBotParams = {
   delayTime: number;
   indexUpdateData: IndexUpdate;
   amountToTradeUSD: number;
-  marginAccount: MarginAccount;
   exchangeAddress: PublicKey;
   signer: Keypair;
   marginAccountAddress: PublicKey;
@@ -40,8 +39,7 @@ type RunPrclBotParams = {
 
 function calculateTotalSharePrice(profitableMarkets: MarketToTrade[]): number {
   return profitableMarkets.reduce((sum, market) => {
-    const sharesToTradeUSD =
-      Number(market.sharesToTrade) * market.pythPriceFeed.price!;
+    const sharesToTradeUSD = Number(market.sharesToTrade) * market.pythPriceFeed.price!;
     return sum + sharesToTradeUSD;
   }, 0);
 }
@@ -54,27 +52,37 @@ async function executeTradesBatched(
   signer: Keypair,
   exchangeAddress: PublicKey,
   marginAccountAddress: PublicKey,
+  marginAccount: MarginAccount,
   amountToTradeUSD: number
 ): Promise<void> {
+  const batchSize = 3;
   const ratio = amountToTradeUSD > sumPrice ? 1 : amountToTradeUSD / sumPrice;
 
-  let currentBatch: MarketToTrade[] = [];
+  let previousBatchesMarketAddress: PublicKey[] = [];
+  let previousBatchesMarketPriceFeeds: PublicKey[] = [];
 
-  for (let i = 0; i < profitableMarkets.length; i++) {
-    currentBatch.push(profitableMarkets[i]);
+  for (let i = 0; i < profitableMarkets.length; i += batchSize) {
+    const currentBatch = profitableMarkets.slice(i, i + batchSize);
 
-    if (currentBatch.length === 3 || i === profitableMarkets.length - 1) {
-      await processMarketBatch(
-        prclSDK,
-        currentBatch,
-        ratio,
-        connection,
-        signer,
-        exchangeAddress,
-        marginAccountAddress
-      );
-      currentBatch = [];
-    }
+    console.log(
+      "Handling batch:",
+      currentBatch.map((market) => market.marketWrapper.market.id)
+    );
+
+    const [marketAddresses, priceFeeds] = await processMarketBatch(
+      prclSDK,
+      currentBatch,
+      ratio,
+      connection,
+      signer,
+      exchangeAddress,
+      marginAccountAddress,
+      previousBatchesMarketAddress,
+      previousBatchesMarketPriceFeeds
+    );
+
+    previousBatchesMarketAddress = [...previousBatchesMarketAddress, ...marketAddresses];
+    previousBatchesMarketPriceFeeds = [...previousBatchesMarketPriceFeeds, ...priceFeeds];
   }
 }
 
@@ -84,7 +92,6 @@ async function runPrclBot({
   delayTime,
   indexUpdateData,
   amountToTradeUSD,
-  marginAccount,
   exchangeAddress,
   signer,
   marginAccountAddress,
@@ -103,16 +110,15 @@ async function runPrclBot({
 
     const currentTime = Date.now();
 
+    const marginAccount = await prclSDK.accountFetcher.getMarginAccount(marginAccountAddress);
+
+    if (!marginAccount) {
+      throw new Error("failed to get margin account");
+    }
+
     const marginAccountWrapper = new MarginAccountWrapper(marginAccount);
-    const marketWrappers = await initializeMarketWrappers(
-      prclSDK,
-      exchange,
-      exchangeAddress
-    );
-    if (
-      currentTime > indexUpdateData.minTime &&
-      currentTime < indexUpdateData.maxTime
-    ) {
+    const marketWrappers = await initializeMarketWrappers(prclSDK, exchange, exchangeAddress);
+    if (currentTime > indexUpdateData.minTime && currentTime < indexUpdateData.maxTime) {
       console.log("Can't trade during index time");
       console.log("Closing all open positions at index time...");
       const openPositions = marginAccountWrapper.positions();
@@ -131,6 +137,8 @@ async function runPrclBot({
 
     console.time("bot iteration time");
 
+    console.log("handling open positions");
+
     if (!firstRun) {
       const openPositions = marginAccountWrapper.positions();
       await handleOpenPositions(
@@ -142,6 +150,8 @@ async function runPrclBot({
         marketWrappers,
         connection
       );
+
+      console.log("open positions: " + openPositions.length);
 
       if (openPositions.length > 0) continue;
     }
@@ -155,6 +165,7 @@ async function runPrclBot({
       tradeOnAllProfitableMarkets
     );
 
+    console.log("profitable markets: " + profitableMarkets.length);
     if (profitableMarkets.length === 0) continue;
 
     const sumPrice = calculateTotalSharePrice(profitableMarkets);
@@ -166,6 +177,7 @@ async function runPrclBot({
       signer,
       exchangeAddress,
       marginAccountAddress,
+      marginAccount,
       amountToTradeUSD
     );
   }
@@ -188,9 +200,7 @@ async function main() {
     throw new Error("Failed to fetch exchange");
   }
 
-  const signer = Keypair.fromSecretKey(
-    bs58.decode(process.env.KEYPAIR as string)
-  );
+  const signer = Keypair.fromSecretKey(bs58.decode(process.env.KEYPAIR as string));
 
   const [marginAccountAddress] = getMarginAccountPda(
     exchangeAddress,
@@ -198,9 +208,7 @@ async function main() {
     config.marginAccountId
   );
 
-  const marginAccount = await prclSDK.accountFetcher.getMarginAccount(
-    marginAccountAddress
-  );
+  const marginAccount = await prclSDK.accountFetcher.getMarginAccount(marginAccountAddress);
 
   if (!marginAccount) {
     throw new Error("failed to get margin account");
@@ -212,7 +220,6 @@ async function main() {
     delayTime: parseInt(process.env.DELAY_TIME ?? "300"),
     indexUpdateData: getIndexUpdateData(config.indexTimes),
     amountToTradeUSD: config.amountToTradeUSD,
-    marginAccount,
     exchangeAddress,
     signer,
     marginAccountAddress,
