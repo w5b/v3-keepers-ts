@@ -19,13 +19,11 @@ export async function handleOpenPositions(
 ) {
   const marketMap = new Map(marketWrappers.map((market) => [market.market.id, market]));
 
-  // First, collect all market addresses and price feeds
   const allMarketData: {
     marketAddress: PublicKey;
     priceFeed: PublicKey;
   }[] = [];
 
-  // Collect all market addresses and price feeds up front
   for (const position of openPositions) {
     const marketToTrade = marketMap.get(position.marketId());
     if (!marketToTrade) continue;
@@ -40,7 +38,6 @@ export async function handleOpenPositions(
   let remainingMarketAddresses = allMarketData.map((data) => data.marketAddress);
   let remainingPriceFeeds = allMarketData.map((data) => data.priceFeed);
 
-  // Process positions in batches of 3
   for (let i = 0; i < openPositions.length; i += 3) {
     const currentBatch = openPositions.slice(i, i + 3);
     const currentBatchData: {
@@ -51,7 +48,6 @@ export async function handleOpenPositions(
       priceFeed: PublicKey;
     }[] = [];
 
-    // Prepare batch data
     for (const position of currentBatch) {
       const marketToTrade = marketMap.get(position.marketId());
       if (!marketToTrade) continue;
