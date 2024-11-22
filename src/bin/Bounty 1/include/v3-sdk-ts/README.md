@@ -3,8 +3,8 @@
 <h1>v3-sdk</h1>
 </div>
 
-[![npm version](https://img.shields.io/npm/v/"../v3-sdk-ts"/latest.svg)](https://www.npmjs.com/package/"../v3-sdk-ts"/v/latest)
-[![npm bundle size (scoped version)](https://img.shields.io/bundlephobia/minzip/"../v3-sdk-ts"/latest.svg)](https://bundlephobia.com/result?p="../v3-sdk-ts"@latest)
+[![npm version](https://img.shields.io/npm/v/@parcl-oss/v3-sdk/latest.svg)](https://www.npmjs.com/package/@parcl-oss/v3-sdk/v/latest)
+[![npm bundle size (scoped version)](https://img.shields.io/bundlephobia/minzip/@parcl-oss/v3-sdk/latest.svg)](https://bundlephobia.com/result?p=@parcl-oss/v3-sdk@latest)
 
 Parcl-v3 client library and SDK in TypeScript.
 
@@ -19,11 +19,11 @@ Pull requests welcome. Please reach out in the discord dev channel with any ques
 ## Installation
 
 ```bash
-npm install "../v3-sdk-ts"
+npm install @parcl-oss/v3-sdk
 
 or
 
-yarn add "../v3-sdk-ts"
+yarn add @parcl-oss/v3-sdk
 ```
 
 ## Usage
