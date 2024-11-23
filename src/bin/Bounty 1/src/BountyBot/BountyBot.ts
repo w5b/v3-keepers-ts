@@ -402,7 +402,7 @@ export default class BountyBot {
       if (firstRun) {
         firstRun = false;
       } else {
-        await new Promise((resolve) => setTimeout(resolve, 5 * 1000)); // trade every 5 minutes
+        await new Promise((resolve) => setTimeout(resolve, 5 *60 * 1000)); // trade every 5 minutes
       }
 
       const currentTime = Date.now();
